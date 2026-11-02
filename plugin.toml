@@ -1,0 +1,51 @@
+api = 1
+name = "微信通知群"
+description = "通过 wechat-ai MCP 只读接收关注群新消息，交给主动性引擎；首次读取只建立基线"
+
+[settings_schema]
+type = "object"
+additionalProperties = false
+
+[settings_schema.properties.url]
+type = "string"
+title = "wechat-ai MCP 地址"
+default = "http://127.0.0.1:8100/mcp"
+
+[settings_schema.properties.token]
+type = "string"
+title = "wechat-ai MCP Token"
+description = "与 WECHAT_AI_MCP_TOKEN 一致；无需填写 Bearer 前缀。"
+writeOnly = true
+default = ""
+
+[settings_schema.properties.groups]
+type = "array"
+title = "关注的微信群"
+description = "每行一个精确群名或群 ID（…@chatroom）。同名群请用 wechat_groups 查询 ID。留空不采集。"
+uniqueItems = true
+maxItems = 50
+default = []
+
+[settings_schema.properties.groups.items]
+type = "string"
+minLength = 1
+maxLength = 200
+
+[settings_schema.properties.poll]
+type = "boolean"
+title = "自动收取群消息"
+default = true
+
+[settings_schema.properties.poll_seconds]
+type = "integer"
+title = "收取间隔（秒）"
+minimum = 10
+maximum = 86400
+default = 30
+
+[settings_schema.properties.timeout]
+type = "integer"
+title = "MCP 请求超时（秒）"
+minimum = 5
+maximum = 120
+default = 30
