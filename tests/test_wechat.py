@@ -18,6 +18,7 @@ from .support import Agent, Judge, Summarizer, eventually
 
 OWNER = Context("web:owner", "owner", "agent", True)
 GROUP = {"username": "100@chatroom", "display_name": "通知群", "is_chatroom": True}
+OTHER = {"username": "300@chatroom", "display_name": "课程群", "is_chatroom": True}
 NOW = int(datetime.now(UTC).timestamp())
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +38,14 @@ def message(number, **extra):
 
 @pytest.fixture
 async def wechat(app, monkeypatch, tmp_path):
-    box = {"rows": [], "calls": [], "fail": False, "duplicate": False, "token": "private-token"}
+    box = {
+        "rows": [],
+        "others": [],
+        "calls": [],
+        "fail": False,
+        "duplicate": False,
+        "token": "private-token",
+    }
 
     def respond(request):
         assert request.headers["Authorization"] == "Bearer " + box["token"]
@@ -65,11 +73,17 @@ async def wechat(app, monkeypatch, tmp_path):
                 contacts = (
                     [GROUP, {**GROUP, "username": "200@chatroom"}] if box["duplicate"] else [GROUP]
                 )
-                data = {"status": "ok", "contacts": contacts}
+                data = {"status": "ok", "contacts": [*contacts, OTHER]}
             elif name == "get_contact_detail":
-                data = {"status": "ok", "contact": GROUP}
+                contact = OTHER if args["contact_name"] == OTHER["username"] else GROUP
+                data = {"status": "ok", "contact": contact}
             elif name in {"get_recent_messages", "search_text_messages"}:
-                data = {"status": "ok", "contact": GROUP, "messages": box["rows"]}
+                other = args["contact_name"] == OTHER["username"]
+                data = {
+                    "status": "ok",
+                    "contact": OTHER if other else GROUP,
+                    "messages": box["others"] if other else box["rows"],
+                }
             else:
                 raise AssertionError("unexpected tool: " + name)
             # FastMCP string returns may appear both in text and a structured result wrapper.
@@ -117,8 +131,9 @@ async def test_first_sync_is_baseline_then_batches_new_messages_and_survives_res
     assert len(events) == 1
     event = events[0]["event"]
     assert event["kind"] == "wechat.messages.received"
-    assert [m["text"] for m in event["payload"]["messages"]] == ["通知 2", "通知 3"]
-    assert event["payload"]["group_id"] == GROUP["username"]
+    [group] = event["payload"]["groups"]
+    assert [m["text"] for m in group["messages"]] == ["通知 2", "通知 3"]
+    assert group["group_id"] == GROUP["username"]
     await plugin.close()
     await plugin.start()
     box["rows"] = [message(4), *box["rows"]]
@@ -153,8 +168,8 @@ async def test_failed_emit_replays_durable_batch_before_reading_new_rows(wechat,
     box["rows"] = [message(2), message(1)]
     monkeypatch.setattr(plugin.context, "emit", emit_then_fail)
     with pytest.raises(RuntimeError):
-        await plugin.sync_group("通知群")
-    assert json.loads(plugin.state_path.read_text())["通知群"]["pending"]
+        await plugin.sync_once()
+    assert json.loads(plugin.state_path.read_text())[main.PENDING]["events"]
     await plugin.close()
     await plugin.start()
     monkeypatch.setattr(plugin.context, "emit", original_emit)
@@ -162,7 +177,8 @@ async def test_failed_emit_replays_durable_batch_before_reading_new_rows(wechat,
     assert await plugin.sync_once() == 1
     events = await app.store.list("event")
     assert len(events) == 2
-    assert sorted(e["event"]["payload"]["messages"][0]["server_id"] for e in events) == ["2", "3"]
+    ids = [e["event"]["payload"]["groups"][0]["messages"][0]["server_id"] for e in events]
+    assert sorted(ids) == ["2", "3"]
 
 
 async def test_backend_errors_leave_cursor_and_recover_without_rebaselining(wechat):
@@ -191,17 +207,19 @@ async def test_non_overlapping_full_window_reports_gap_and_forwards_available_me
     await plugin.sync_once()
     box["rows"] = [message(i) for i in range(500, 700)]
     assert await plugin.sync_once() == 200
-    events = await app.store.list("event")
-    assert {e["event"]["kind"] for e in events} == {"wechat.sync.gap", "wechat.messages.received"}
+    [event] = [e["event"] for e in await app.store.list("event")]
+    assert event["kind"] == "wechat.messages.received"
+    assert event["payload"]["gaps"][0]["group_id"] == GROUP["username"]
+    assert event["payload"]["groups"][0]["count"] == 200
     assert await plugin.sync_once() == 0
-    assert len(await app.store.list("event")) == 2
+    assert len(await app.store.list("event")) == 1
 
 
 async def test_ambiguous_name_does_not_collect_a_random_group(wechat):
     _, plugin, box = wechat
     box["duplicate"] = True
     with pytest.raises(PublicError, match="精确群 ID"):
-        await plugin.sync_group("通知群")
+        await plugin.collect("通知群")
     assert not any(name == "get_recent_messages" for name, _ in box["calls"])
     assert not plugin.state
 
@@ -280,7 +298,7 @@ async def test_invalid_message_does_not_advance_baseline_or_cursor(wechat):
     before = plugin.state_path.read_text()
     box["rows"] = [message(2, create_time="not-a-timestamp")]
     with pytest.raises(ValueError):
-        await plugin.sync_group("通知群")
+        await plugin.collect("通知群")
     assert plugin.state_path.read_text() == before
 
 
@@ -305,3 +323,44 @@ async def test_repository_zip_installs_and_loads_without_host_changes(app):
     await app.plugins.reload("wechat_archive")
     result = json.loads(await app.registry.execute(OWNER, "wechat_status", {}))
     assert result["groups"] == []
+
+
+async def test_messages_from_all_groups_merge_into_one_event_per_poll(wechat):
+    app, plugin, box = wechat
+    plugin.context.settings["groups"] = ["通知群", OTHER["username"]]
+    await plugin.start()
+    box["rows"], box["others"] = [message(1)], [message(11)]
+    assert await plugin.sync_once() == 0
+    box["rows"] = [message(2), message(1)]
+    box["others"] = [message(13), message(12), message(11)]
+    assert await plugin.sync_once() == 3
+    [event] = [e["event"] for e in await app.store.list("event")]
+    assert event["kind"] == "wechat.messages.received"
+    assert event["payload"]["count"] == 3
+    groups = {g["group_id"]: [m["text"] for m in g["messages"]] for g in event["payload"]["groups"]}
+    assert groups == {GROUP["username"]: ["通知 2"], OTHER["username"]: ["通知 12", "通知 13"]}
+    box["others"] = [message(14), *box["others"]]
+    assert await plugin.sync_once() == 1
+    latest = [e["event"] for e in await app.store.list("event")]
+    assert len(latest) == 2
+
+
+async def test_legacy_per_group_outbox_is_replayed(wechat):
+    app, plugin, box = wechat
+    box["rows"] = [message(1)]
+    await plugin.sync_once()
+    state = json.loads(plugin.state_path.read_text())
+    legacy = main.ExternalEvent(
+        source="wechat", kind="wechat.messages.received", dedup_key="legacy", title="旧批次"
+    )
+    state["通知群"]["pending"] = {
+        "events": [legacy.model_dump(mode="json")],
+        "next": {**state["通知群"], "seen": state["通知群"]["seen"] + ["server:2"]},
+    }
+    plugin.state_path.write_text(json.dumps(state))
+    await plugin.close()
+    await plugin.start()
+    box["rows"] = [message(2), message(1)]
+    assert await plugin.sync_once() == 0
+    assert [e["event"]["dedup_key"] for e in await app.store.list("event")] == ["legacy"]
+    assert main.PENDING not in json.loads(plugin.state_path.read_text())
