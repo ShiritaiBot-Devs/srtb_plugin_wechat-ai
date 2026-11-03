@@ -195,6 +195,7 @@ async def test_backend_errors_leave_cursor_and_recover_without_rebaselining(wech
     ]
     assert len(failures) == 1
     assert "private-token" not in json.dumps(failures)
+    assert failures[0]["event"]["payload"]["failures"] == [{"group": "通知群", "error": "McpError"}]
     box["fail"] = False
     box["rows"] = [message(2), message(1)]
     assert await plugin.sync_once() == 1
@@ -222,6 +223,33 @@ async def test_ambiguous_name_does_not_collect_a_random_group(wechat):
         await plugin.collect("通知群")
     assert not any(name == "get_recent_messages" for name, _ in box["calls"])
     assert not plugin.state
+
+
+async def test_renamed_group_failure_reports_public_reason_and_closest_name(wechat):
+    app, plugin, box = wechat
+    plugin.context.settings["groups"] = ["通知群2025", "毫不相关"]
+    await plugin.start()
+    assert await plugin.sync_once() == 0
+    [event] = [e["event"] for e in await app.store.list("event")]
+    assert event["kind"] == "wechat.sync.failed"
+    errors = {f["group"]: f["error"] for f in event["payload"]["failures"]}
+    assert errors["通知群2025"] == (
+        "PublicError: 无法唯一确定关注群，请用 wechat_groups 查询精确群 ID 后配置"
+        "；疑似已改名为：通知群，请更新关注列表配置"
+    )
+    assert errors["毫不相关"].startswith("PublicError: 无法唯一确定关注群")
+    assert "疑似" not in errors["毫不相关"]
+
+
+def test_renamed_picks_one_closest_chatroom():
+    contacts = [
+        {"username": "wxid_a", "display_name": "高数通知群", "is_chatroom": False},
+        GROUP,
+        OTHER,
+        {"username": "400@chatroom", "display_name": "高数通知群（新）", "is_chatroom": True},
+    ]
+    assert main.renamed("高数通知群", contacts) == "高数通知群（新）"
+    assert main.renamed("期末", contacts) == ""
 
 
 @pytest.mark.parametrize(

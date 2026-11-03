@@ -8,6 +8,7 @@ import json
 import math
 import os
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from urllib.parse import urlsplit
 
 from shiritaibot.plugin_api import (
@@ -63,6 +64,20 @@ def identity(row: dict) -> str:
     if row.get("local_id") is None:
         raise PublicError("微信消息缺少稳定 ID，本次不推进进度")
     return "local:" + digest([row["local_id"], row.get("sort_seq"), row["create_time"]])
+
+
+def renamed(selector: str, contacts: list) -> str:
+    """Closest chatroom name for a configured name that no longer matches exactly."""
+    names = [
+        str(c.get("display_name") or "")[:100]
+        for c in contacts
+        if isinstance(c, dict)
+        and c.get("is_chatroom")
+        and str(c.get("username", "")).endswith("@chatroom")
+    ]
+    scored = [(selector in n, SequenceMatcher(None, selector, n).ratio(), n) for n in names if n]
+    best = max(scored, default=None)
+    return best[2] if best and (best[0] or best[1] >= 0.5) else ""
 
 
 class Entry(Plugin):
@@ -216,6 +231,7 @@ class Entry(Plugin):
         state = self.state.get(selector, {})
         if state.get("username"):
             selector = state["username"]
+        contacts = []
         if selector.endswith("@chatroom"):
             result = await self.rpc("get_contact_detail", {"contact_name": selector})
             assert isinstance(result, dict)
@@ -231,9 +247,10 @@ class Entry(Plugin):
                 },
             )
             assert isinstance(result, dict)
+            contacts = result["contacts"]
             matches = [
                 c
-                for c in result["contacts"]
+                for c in contacts
                 if selector
                 in [c.get(k) for k in ("username", "display_name", "remark", "nick_name", "alias")]
             ]
@@ -245,7 +262,11 @@ class Entry(Plugin):
         if len(matches) != 1 or (
             selector.endswith("@chatroom") and matches[0]["username"] != selector
         ):
-            raise PublicError("无法唯一确定关注群，请用 wechat_groups 查询精确群 ID 后配置")
+            hint = "" if matches else renamed(selector, contacts)
+            raise PublicError(
+                "无法唯一确定关注群，请用 wechat_groups 查询精确群 ID 后配置"
+                + (f"；疑似已改名为：{hint}，请更新关注列表配置" if hint else "")
+            )
         return matches[0]
 
     async def status(self, ctx, args):
@@ -437,8 +458,11 @@ class Entry(Plugin):
                 try:
                     batches.append(await self.collect(group))
                 except Exception as exc:
-                    errors[group] = type(exc).__name__
                     # Never log backend exception text: it can contain chat contents or tokens.
+                    # Plugin-authored PublicError text is sanitized and tells config from outages.
+                    errors[group] = type(exc).__name__ + (
+                        f": {exc}" if isinstance(exc, PublicError) else ""
+                    )
                     self.context.logger.warning(
                         f"微信群收取失败（{errors[group]}），保留进度待下次重试"
                     )
