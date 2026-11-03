@@ -258,6 +258,19 @@ async def test_query_tools_enforce_allowlist_and_never_change_subscription_curso
     assert plugin.state_path.read_text() == before
 
 
+async def test_query_tools_accept_cached_group_id_of_configured_group(wechat):
+    _, plugin, box = wechat
+    with pytest.raises(PublicError, match="关注列表"):
+        await plugin.history(OWNER, {"group": GROUP["username"]})
+    box["rows"] = [message(1)]
+    await plugin.sync_once()
+    result = await plugin.history(OWNER, {"group": GROUP["username"]})
+    assert result["messages"] == box["rows"]
+    await plugin.search(OWNER, {"group": GROUP["username"], "query": "通知"})
+    with pytest.raises(PublicError, match="关注列表"):
+        await plugin.history(OWNER, {"group": OTHER["username"]})
+
+
 async def test_plugin_is_discovered_disabled_and_registers_tools_when_enabled(app):
     meta = next(p for p in await app.plugins.listing() if p["id"] == "wechat")
     assert not meta["enabled"] and meta["defaults"]["groups"] == []

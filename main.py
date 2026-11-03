@@ -284,7 +284,12 @@ class Entry(Plugin):
         self.require_owner(ctx)
         group = args["group"]
         if group not in self.groups:
-            raise PublicError("该群尚未加入关注列表，请由主人在插件配置中添加")
+            # Accept the group ID cached for a configured selector, then reuse that selector.
+            group = next(
+                (g for g in self.groups if self.state.get(g, {}).get("username") == group), None
+            )
+            if group is None:
+                raise PublicError("该群尚未加入关注列表，请由主人在插件配置中添加")
         return await self.resolve(group)
 
     async def recent(self, username: str, limit=LIMIT):
