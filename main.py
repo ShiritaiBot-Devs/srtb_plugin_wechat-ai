@@ -301,16 +301,61 @@ class Entry(Plugin):
             },
         )
 
+    async def match_configured(self, name: str) -> tuple[str | None, str]:
+        """Map a chatroom display name from proactive events back to a configured selector.
+
+        Only configured groups can match, so the readable scope stays the watch list.
+        Returns the selector (or None) and a rename hint for the error message.
+        """
+        result = await self.rpc(
+            "search_contacts",
+            {"query": name, "limit": 100, "include_chatrooms": True, "include_contacts": False},
+        )
+        assert isinstance(result, dict)
+        contacts = [
+            c
+            for c in result.get("contacts", [])
+            if isinstance(c, dict)
+            and c.get("is_chatroom")
+            and str(c.get("username", "")).endswith("@chatroom")
+        ]
+        usernames = {
+            c["username"]
+            for c in contacts
+            if name
+            and name in [c.get(k) for k in ("username", "display_name", "remark", "nick_name", "alias")]
+        }
+        selectors = [
+            g
+            for g in self.groups
+            if g in usernames or self.state.get(g, {}).get("username") in usernames
+        ]
+        if len(selectors) > 1:
+            raise PublicError("传入群名匹配到多个关注群，请用 wechat_groups 查询精确群 ID 后调用")
+        if selectors:
+            return selectors[0], ""
+        # A real chatroom that is simply not configured gets no rename hint.
+        return None, "" if usernames else renamed(name, contacts)
+
     async def selected(self, ctx, args):
         self.require_owner(ctx)
         group = args["group"]
         if group not in self.groups:
             # Accept the group ID cached for a configured selector, then reuse that selector.
-            group = next(
+            selector = next(
                 (g for g in self.groups if self.state.get(g, {}).get("username") == group), None
             )
-            if group is None:
-                raise PublicError("该群尚未加入关注列表，请由主人在插件配置中添加")
+            if selector is None:
+                # Proactive events carry the chatroom's current display name, which may differ
+                # from the configured selector; resolve it and map it back to a configured
+                # subscription instead of rejecting it outright.
+                selector, hint = await self.match_configured(group)
+                if selector is None:
+                    raise PublicError(
+                        "该群尚未加入关注列表，请由主人在插件配置中添加"
+                        + (f"；疑似已改名为：{hint}，请更新关注列表配置" if hint else "")
+                    )
+            group = selector
         return await self.resolve(group)
 
     async def recent(self, username: str, limit=LIMIT):
