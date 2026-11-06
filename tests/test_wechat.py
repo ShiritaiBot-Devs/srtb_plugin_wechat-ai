@@ -44,6 +44,7 @@ async def wechat(app, monkeypatch, tmp_path):
         "calls": [],
         "fail": False,
         "duplicate": False,
+        "display": None,
         "token": "private-token",
     }
 
@@ -70,8 +71,9 @@ async def wechat(app, monkeypatch, tmp_path):
             if name == "get_timestamp":
                 data = NOW * 1000 + 500
             elif name == "search_contacts":
+                group = {**GROUP, "display_name": box["display"]} if box["display"] else GROUP
                 contacts = (
-                    [GROUP, {**GROUP, "username": "200@chatroom"}] if box["duplicate"] else [GROUP]
+                    [group, {**group, "username": "200@chatroom"}] if box["duplicate"] else [group]
                 )
                 data = {"status": "ok", "contacts": [*contacts, OTHER]}
             elif name == "get_contact_detail":
@@ -297,6 +299,45 @@ async def test_query_tools_accept_cached_group_id_of_configured_group(wechat):
     await plugin.search(OWNER, {"group": GROUP["username"], "query": "通知"})
     with pytest.raises(PublicError, match="关注列表"):
         await plugin.history(OWNER, {"group": OTHER["username"]})
+
+
+async def test_query_tools_resolve_active_event_display_name_to_configured_group(wechat):
+    """Proactive events push the current display name; it must reach the configured group."""
+    _, plugin, box = wechat
+    await plugin.sync_once()  # caches the configured group's username
+    box["display"] = "新通知群"
+    box["rows"] = [message(1)]
+    before = plugin.state_path.read_text()
+    result = await plugin.history(OWNER, {"group": "新通知群"})
+    assert result["messages"] == box["rows"]
+    assert result["contact"]["username"] == GROUP["username"]
+    await plugin.search(OWNER, {"group": "新通知群", "query": "通知"})
+    assert plugin.state_path.read_text() == before
+
+
+async def test_display_name_without_cached_username_is_rejected(wechat):
+    _, plugin, box = wechat
+    box["display"] = "新通知群"
+    # Without a cached username there is nothing to map the display name back to yet.
+    with pytest.raises(PublicError, match="关注列表"):
+        await plugin.history(OWNER, {"group": "新通知群"})
+    assert not plugin.state.get("通知群")
+
+
+async def test_display_name_of_unwatched_group_is_still_rejected(wechat):
+    _, plugin, _ = wechat
+    await plugin.sync_once()
+    with pytest.raises(PublicError, match="该群尚未加入关注列表") as excinfo:
+        await plugin.history(OWNER, {"group": OTHER["display_name"]})
+    # The group exists in contacts, so there is no rename hint.
+    assert "疑似" not in str(excinfo.value)
+
+
+async def test_display_name_mismatch_suggests_renamed_group(wechat):
+    _, plugin, _ = wechat
+    await plugin.sync_once()
+    with pytest.raises(PublicError, match="疑似已改名为：通知群"):
+        await plugin.history(OWNER, {"group": "通知群（新）"})
 
 
 async def test_plugin_is_discovered_disabled_and_registers_tools_when_enabled(app):
